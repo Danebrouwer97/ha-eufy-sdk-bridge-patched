@@ -1,0 +1,97 @@
+# Keeps the patched app in step with the official eufy-sdk bridge app.
+#
+# Daily (and on demand): if the official app has a new version, apply the patch to that version's bridge,
+# run the bridge's tests, build the app image on it, and open a pull request with the update. Merging it
+# makes Home Assistant offer the update. If the patch no longer applies or a test fails, open an issue
+# instead (GitHub emails the repo owner), and leave the app as it is.
+#
+# On every push and pull request: run the same tests and build for the version already pinned.
+name: Check upstream
+
+on:
+  schedule:
+    - cron: "17 5 * * *" # daily, 05:17 UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: check-upstream-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Compare with the official app and test the patch
+        id: run
+        run: |
+          case "${{ github.event_name }}" in
+            schedule|workflow_dispatch) mode=check ;;
+            *) mode=verify ;;
+          esac
+          scripts/check-upstream.sh "$mode" 2>&1 | tee run.log
+
+      - name: Open a pull request with the update
+        if: steps.run.outputs.status == 'updated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OFFICIAL: ${{ steps.run.outputs.official }}
+          BRIDGE: ${{ steps.run.outputs.bridge }}
+        run: |
+          branch="upstream/$OFFICIAL"
+          if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != 0 ]; then
+            echo "A pull request for $OFFICIAL is already open."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add -A eufy_sdk_bridge_patched patches
+          git commit -m "Update to the official eufy-sdk bridge app $OFFICIAL (bridge $BRIDGE)"
+          git push -f origin "$branch"
+          gh pr create --head "$branch" --base main \
+            --title "Update to the official eufy-sdk bridge app $OFFICIAL" \
+            --body "The official eufy-sdk bridge app is now **$OFFICIAL** (bridge $BRIDGE).
+
+          The patch applied to bridge $BRIDGE, all of the bridge's tests passed with it, and the app image built on \`ghcr.io/mega-yfue/addon-eufy-sdk-bridge:$OFFICIAL\`.
+
+          This updates the app folder (version, base image, config copied from the official app) and the patch. Merge it, then press **Update** on the app in Home Assistant.
+
+          Official changes: https://github.com/mega-yfue/ha-eufy-sdk-addon/blob/main/eufy_sdk_bridge/CHANGELOG.md"
+
+      - name: Report a failure as an issue
+        if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OFFICIAL: ${{ steps.run.outputs.official }}
+          BRIDGE: ${{ steps.run.outputs.bridge }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="The patch doesn't work with the official app ${OFFICIAL:-(unknown version)}"
+          body="The daily check failed for the official eufy-sdk bridge app ${OFFICIAL:-?} (bridge ${BRIDGE:-?}). Home Assistant keeps running the current version.
+
+          Log: $RUN_URL
+
+          \`\`\`
+          $(tail -n 40 run.log 2>/dev/null)
+          \`\`\`"
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

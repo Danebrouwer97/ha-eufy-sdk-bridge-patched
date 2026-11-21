@@ -1,0 +1,8 @@
+# Built FROM the official eufy-sdk bridge app image (multi-arch). Kept up to date by
+# .github/workflows/check-upstream.yml; BRIDGE_VERSION is the bridge release inside that image, which the
+# patch in ../patches is tested against.
+build_from:
+  aarch64: ghcr.io/mega-yfue/addon-eufy-sdk-bridge:0.8.2
+  amd64: ghcr.io/mega-yfue/addon-eufy-sdk-bridge:0.8.2
+args:
+  BRIDGE_VERSION: "0.7.2"

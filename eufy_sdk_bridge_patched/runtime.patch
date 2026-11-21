@@ -1,0 +1,417 @@
+diff --git a/go2rtc-config.mjs b/go2rtc-config.mjs
+index de6cfdd..b3fc7f7 100644
+--- a/go2rtc-config.mjs
++++ b/go2rtc-config.mjs
+@@ -28,6 +28,10 @@ export async function writeGo2rtcConfig(cfg, devices) {
+     '  eufy_h264: "-analyzeduration 0 -probesize 32768 -f h264 -i {input}"',
+     "streams:",
+   ];
++  // Live audio rides as a second source of the same stream: go2rtc dials it only for a viewer that wants
++  // audio, and converts the camera's AAC / A-law to Opus, which WebRTC plays. See src/live-audio.mjs.
++  const audioInput = '  eufy_audio: "-fflags nobuffer -probesize 4096 -analyzeduration 0 -i {input}"';
++  if (cfg.liveAudio !== false) lines.splice(lines.indexOf("streams:"), 0, audioInput);
+   for (const d of cams) {
+     // A stream id per camera serial; the source is this bridge's own HTTP feed.
+     // `#async` makes ffmpeg stamp frames from the wall clock (-use_wallclock_as_timestamps 1 -async 1)
+@@ -39,7 +43,13 @@ export async function writeGo2rtcConfig(cfg, devices) {
+     // Use a named template: inline {input} is interpreted as a go2rtc source replacement.
+     const input = ["T8400", "T8410"].includes(d.model) ? "#input=eufy_h264" : "";
+     for (const view of d.views ?? [{ id: d.sn, stream: d.stream }]) {
+-      lines.push(`  ${view.id}: ffmpeg:http://${cfg.selfHost}:${cfg.port}${view.stream}#video=copy#async${input}`);
++      const video = `ffmpeg:http://${cfg.selfHost}:${cfg.port}${view.stream}#video=copy#async${input}`;
++      if (cfg.liveAudio === false) {
++        lines.push(`  ${view.id}: ${video}`);
++        continue;
++      }
++      const audio = `ffmpeg:http://${cfg.selfHost}:${cfg.port}${view.stream.replace(/^\/stream\//, "/audio/")}#input=eufy_audio#audio=opus#async`;
++      lines.push(`  ${view.id}:`, `    - ${video}`, `    - ${audio}`);
+     }
+   }
+   const yaml = lines.join("\n") + "\n";
+diff --git a/src/config.mjs b/src/config.mjs
+index 1faa62e..d339edc 100644
+--- a/src/config.mjs
++++ b/src/config.mjs
+@@ -91,6 +91,12 @@ export function loadConfig(env = process.env) {
+     go2rtcRtspPort: positiveInt(env.GO2RTC_RTSP_PORT) ?? 8554,
+     go2rtcWebrtcPort: positiveInt(env.GO2RTC_WEBRTC_PORT) ?? 8555,
+     selfHost: env.BRIDGE_SELF_HOST || "127.0.0.1",
++    // Live audio: go2rtc adds each camera's /audio feed to its stream, so a viewer hears the camera. It only
++    // plays alongside video someone is already watching. BRIDGE_LIVE_AUDIO=0 turns it off.
++    liveAudio: env.BRIDGE_LIVE_AUDIO == null ? true : truthy(env.BRIDGE_LIVE_AUDIO),
++    // Who may talk through a camera's speaker (/talk): comma-separated CIDRs. Default: loopback and the
++    // Home Assistant Supervisor network. The bridge's HTTP has no auth, so keep this narrow.
++    talkAllow: env.BRIDGE_TALK_ALLOW || "127.0.0.0/8,::1/128,172.30.32.0/23",
+     // Cloud poll interval (ms). Unset → the SDK default (600000 = 10 min). Changeable live via the
+     // config.set WS command. 0 disables polling.
+     pollMs: env.EUFY_POLL_MS ? Number(env.EUFY_POLL_MS) : undefined,
+diff --git a/src/http-routes.mjs b/src/http-routes.mjs
+index 62307f9..67fbd26 100644
+--- a/src/http-routes.mjs
++++ b/src/http-routes.mjs
+@@ -11,6 +11,8 @@ import { onBatteryPower } from "./power.mjs";
+ import { storedThumbnailSeenAt } from "./stored-thumbnail.mjs";
+ import { redactSecrets } from "./redact.mjs";
+ import { cameraViews, cameraView, requestedView } from "./camera-views.mjs";
++import { serveLiveAudio } from "./live-audio.mjs";
++import { serveTalk, addressMatcher } from "./talkback-route.mjs";
+ 
+ function json(res, code, body) {
+   const s = redactSecrets(JSON.stringify(body));
+@@ -40,6 +42,11 @@ export function createHttpHandler(ctx) {
+   // A failed session is never reused, but it is not dropped under a request still streaming on it:
+   // such a lease is dropped once its last feed ends (see cleanup).
+   const dropWhenIdle = new WeakSet();
++  // /audio consumers riding on a camera's open /stream (see live-audio.mjs). They end with its last /stream.
++  const openAudio = new Map(); // sn -> Set<consumer>
++  /** The stream client of an open /stream for this camera, or undefined when nobody is watching it. */
++  const watchedLease = (sn) => openFeeds.get(sn)?.values().next().value?.lease;
++  const talkAllowed = addressMatcher(cfg?.talkAllow);
+ 
+   /** The persisted image when it was written after `since` and differs from `jpeg`, else undefined. */
+   async function diskCopyNewerThan(file, since, jpeg) {
+@@ -118,7 +125,7 @@ export function createHttpHandler(ctx) {
+     if (!flags.ready) return json(res, 503, { error: "not authenticated", auth: ctx.authStatus() });
+ 
+     let view = 0;
+-    if ((kind === "stream" || kind === "snapshot") && sn) {
++    if ((kind === "stream" || kind === "snapshot" || kind === "audio") && sn) {
+       try {
+         view = requestedView(url.searchParams);
+       } catch (e) {
+@@ -405,6 +412,7 @@ export function createHttpHandler(ctx) {
+           }
+           if (feeds.size) return;
+           openFeeds.delete(sn);
++          for (const consumer of openAudio.get(sn) ?? []) consumer.stop(); // audio never outlives the video
+           if (streaming.delete(sn)) ctx.broadcast({ event: "streamState", deviceSn: sn, active: false });
+         };
+         req.on("close", cleanup);
+@@ -429,6 +437,45 @@ export function createHttpHandler(ctx) {
+       }
+     }
+ 
++    // The camera's live audio, for go2rtc to add to the stream someone is watching (see live-audio.mjs).
++    if (kind === "audio" && sn && cfg.liveAudio !== false) {
++      return serveLiveAudio({
++        req,
++        res,
++        sn,
++        view,
++        watchedLease: () => watchedLease(sn),
++        register: (consumer) => {
++          let set = openAudio.get(sn);
++          if (!set) openAudio.set(sn, (set = new Set()));
++          set.add(consumer);
++          return () => {
++            set.delete(consumer);
++            if (!set.size && openAudio.get(sn) === set) openAudio.delete(sn);
++          };
++        },
++        fail: (code, body) => (res.headersSent ? res.destroy() : json(res, code, body)),
++        log: ctx.eventLog,
++        waitMs: ctx.audioWaitForVideoMs, // test knobs; undefined → the defaults in live-audio.mjs
++        firstFrameMs: ctx.audioFirstFrameMs,
++      });
++    }
++
++    // Push-to-talk through the camera's speaker (see talkback-route.mjs).
++    if (kind === "talk" && sn) {
++      return serveTalk({
++        req,
++        res,
++        sn,
++        url,
++        watchedLease: () => watchedLease(sn),
++        allowed: talkAllowed,
++        reply: (code, body) => (res.headersSent ? res.end() : json(res, code, body)),
++        log: ctx.eventLog,
++        ...(ctx.spawnTalkEncoder ? { spawnEncoder: ctx.spawnTalkEncoder } : {}), // tests: no real ffmpeg
++      });
++    }
++
+     return json(res, 404, { error: "not found" });
+   };
+ }
+diff --git a/src/live-audio.mjs b/src/live-audio.mjs
+new file mode 100644
+index 0000000..785732f
+--- /dev/null
++++ b/src/live-audio.mjs
+@@ -0,0 +1,123 @@
++// /audio/<sn>: the camera's live audio as a plain HTTP feed, for go2rtc to add to the camera's stream.
++//
++// The SDK never interleaves audio into the raw video Readable that /stream serves, but `live()` attaches
++// a consumer to the same shared source and emits each audio access unit. go2rtc lists this feed as a
++// second source of the camera's stream (see go2rtc-config.mjs), so a viewer that asks for audio gets it
++// and one that doesn't never opens it.
++//
++// Audio only rides along on video someone is already watching: it waits for /stream to be open for this
++// camera and never opens a session itself, so asking for sound can't wake a camera. It also stops when the
++// last /stream for the camera ends (http-routes.mjs), so it can't hold a battery camera awake on its own.
++//
++// Output, decided by the first frame's codec:
++//   aac-lc → ADTS, as the station sends it (self-describing; ffmpeg needs no input flags)
++//   g711a  → a streaming WAV (A-law, 16 kHz mono — what the eufy app assumes for every audio type)
++//   aac-eld → refused: raw access units with no transport framing, which go2rtc's ffmpeg can't read here
++
++/** How long to wait for a /stream of this camera to be open before giving up. */
++export const AUDIO_WAIT_FOR_VIDEO_MS = 20_000;
++/** How long the shared source may go without an audio frame before the camera counts as silent. */
++export const AUDIO_FIRST_FRAME_MS = 4_000;
++const SAMPLE_RATE = 16_000;
++
++/** A WAV header for an open-ended A-law stream (sizes set to the maximum, as streaming WAV writers do). */
++export function alawWavHeader(rate = SAMPLE_RATE) {
++  const h = Buffer.alloc(44);
++  h.write("RIFF", 0);
++  h.writeUInt32LE(0xffffffff, 4);
++  h.write("WAVE", 8);
++  h.write("fmt ", 12);
++  h.writeUInt32LE(16, 16); // fmt chunk size
++  h.writeUInt16LE(6, 20); // WAVE_FORMAT_ALAW
++  h.writeUInt16LE(1, 22); // mono
++  h.writeUInt32LE(rate, 24);
++  h.writeUInt32LE(rate, 28); // byte rate: 1 byte per sample
++  h.writeUInt16LE(1, 32); // block align
++  h.writeUInt16LE(8, 34); // bits per sample
++  h.write("data", 36);
++  h.writeUInt32LE(0xffffffff, 40);
++  return h;
++}
++
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++
++/**
++ * Serve one /audio request.
++ *
++ * @param {object} o
++ * @param {import("node:http").IncomingMessage} o.req
++ * @param {import("node:http").ServerResponse} o.res
++ * @param {string} o.sn
++ * @param {number} o.view
++ * @param {() => Promise<any> | undefined} o.watchedLease the stream client of an open /stream for this
++ *   camera, or undefined while nobody watches it
++ * @param {(consumer: { stop(): void }) => () => void} o.register tracks the consumer so the end of the
++ *   camera's last /stream can stop it; returns the function that unregisters it
++ * @param {(status: number, body: object) => void} o.fail sends a JSON error (only before any audio)
++ * @param {(msg: string) => void} [o.log]
++ */
++export async function serveLiveAudio({ req, res, sn, view, watchedLease, register, fail, log = () => {}, waitMs = AUDIO_WAIT_FOR_VIDEO_MS, firstFrameMs = AUDIO_FIRST_FRAME_MS }) {
++  let gone = false;
++  res.once("close", () => (gone = true));
++
++  // Wait for someone to be watching: go2rtc may dial this source before /stream has finished opening.
++  let lease;
++  for (const end = Date.now() + waitMs; !(lease = watchedLease()) && Date.now() < end && !gone; ) await sleep(250);
++  if (gone) return;
++  if (!lease) return fail(503, { error: "audio only plays alongside a live view; no /stream is open for this camera" });
++
++  let consumer;
++  try {
++    const client = await lease;
++    const cam = (await client.getDevice(sn)).camera?.();
++    if (!cam?.live) return fail(404, { error: "no live media on this device" });
++    consumer = await cam.live(view === 0 ? undefined : { view });
++  } catch (e) {
++    return fail(502, { error: String(e?.message ?? e) });
++  }
++  if (gone) return void consumer.stop();
++
++  const unregister = register(consumer);
++  let started = false;
++  let done = false;
++  const finish = (err) => {
++    if (done) return;
++    done = true;
++    clearTimeout(silentTimer);
++    unregister();
++    consumer.stop();
++    if (!started) return err ? fail(err.status, { error: err.message }) : undefined;
++    if (err) res.destroy();
++    else res.end();
++  };
++  const silentTimer = setTimeout(() => {
++    log(`/audio ${sn} — no audio from the camera within ${firstFrameMs} ms (its microphone may be off)`);
++    finish({ status: 404, message: "this camera's live stream carries no audio" });
++  }, firstFrameMs);
++
++  consumer.on("audio", (frame) => {
++    if (done) return;
++    if (!started) {
++      if (frame.codec === "aac-lc") {
++        res.writeHead(200, { "content-type": "audio/aac", "cache-control": "no-cache" });
++      } else if (frame.codec === "g711a") {
++        res.writeHead(200, { "content-type": "audio/wav", "cache-control": "no-cache" });
++        res.write(alawWavHeader());
++      } else {
++        log(`/audio ${sn} — ${frame.codec} audio isn't supported`);
++        return finish({ status: 415, message: `${frame.codec} audio isn't supported` });
++      }
++      started = true;
++      clearTimeout(silentTimer);
++      log(`/audio ${sn} — ${frame.codec} audio flowing`);
++    }
++    // Backpressure pauses the consumer, which drops to fresh audio inside the SDK instead of buffering here.
++    if (!res.write(frame.data)) {
++      consumer.pause?.();
++      res.once("drain", () => consumer.resume?.());
++    }
++  });
++  consumer.on("stop", () => finish());
++  consumer.on("error", (e) => finish({ status: 502, message: String(e?.message ?? e) }));
++  req.on("close", () => finish());
++}
+diff --git a/src/talkback-route.mjs b/src/talkback-route.mjs
+new file mode 100644
+index 0000000..93cb8ac
+--- /dev/null
++++ b/src/talkback-route.mjs
+@@ -0,0 +1,147 @@
++// /talk/<sn>: speak through a camera's speaker. One POST (or PUT) is one push-to-talk: the body streams raw
++// PCM while the person talks, and the talk ends when the body does.
++//
++// The SDK's talkback wants AAC-LC 16 kHz mono in ADTS frames (or raw AAC-ELD units on some models). The
++// body is encoded with the bundled ffmpeg, so a caller can send what a browser microphone gives it:
++//   ?format=s16le (default) — 16-bit little-endian PCM, 16 kHz mono
++//   ?format=alaw            — G.711 A-law, 8 kHz mono (what RTP/WebRTC backchannels carry)
++//
++// Talking only works while someone is watching: it needs a /stream open for the camera, and never opens a
++// session itself, so a stray request can't wake a battery camera. The bridge's HTTP has no auth, and this
++// route plays sound at the door, so it only answers callers from the allowed networks (BRIDGE_TALK_ALLOW;
++// by default loopback and the Home Assistant Supervisor network, where Home Assistant reaches add-ons).
++import { spawn } from "node:child_process";
++import net from "node:net";
++
++export const TALK_IDLE_MS = 5_000; // a body that goes quiet this long ends the talk
++export const TALK_MAX_MS = 5 * 60_000; // hard cap on one talk
++export const DEFAULT_TALK_ALLOW = "127.0.0.0/8,::1/128,172.30.32.0/23";
++
++const INPUT = {
++  s16le: ["-f", "s16le", "-ar", "16000", "-ac", "1"],
++  alaw: ["-f", "alaw", "-ar", "8000", "-ac", "1"],
++};
++
++/** ffmpeg turning the body's PCM into AAC-LC 16 kHz mono ADTS, one frame per packet, flushed as it goes. */
++export function spawnAacEncoder(format) {
++  return spawn(
++    "ffmpeg",
++    ["-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", ...INPUT[format], "-i", "pipe:0",
++      "-ar", "16000", "-ac", "1", "-c:a", "aac", "-b:a", "32k", "-f", "adts", "-flush_packets", "1", "pipe:1"],
++    { stdio: ["pipe", "pipe", "pipe"] },
++  );
++}
++
++/** A matcher for a comma-separated list of CIDRs (IPv4 and IPv6). IPv4-mapped IPv6 addresses match as IPv4. */
++export function addressMatcher(list = DEFAULT_TALK_ALLOW) {
++  const block = new net.BlockList();
++  for (const raw of String(list).split(",").map((s) => s.trim()).filter(Boolean)) {
++    const [addr, bits] = raw.split("/");
++    const type = net.isIPv6(addr) ? "ipv6" : "ipv4";
++    if (bits == null) block.addAddress(addr, type);
++    else block.addSubnet(addr, Number(bits), type);
++  }
++  return (ip) => {
++    if (!ip) return false;
++    const v4 = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
++    return net.isIPv4(v4) ? block.check(v4, "ipv4") : block.check(ip, "ipv6");
++  };
++}
++
++/**
++ * Serve one /talk request.
++ *
++ * @param {object} o
++ * @param {import("node:http").IncomingMessage} o.req
++ * @param {import("node:http").ServerResponse} o.res
++ * @param {string} o.sn
++ * @param {() => Promise<any> | undefined} o.watchedLease the stream client of an open /stream for this camera
++ * @param {(ip: string) => boolean} o.allowed
++ * @param {(status: number, body: object) => void} o.reply sends the JSON answer
++ * @param {(format: string) => import("node:child_process").ChildProcess} [o.spawnEncoder]
++ * @param {(msg: string) => void} [o.log]
++ */
++export async function serveTalk({ req, res, sn, url, watchedLease, allowed, reply, spawnEncoder = spawnAacEncoder, log = () => {}, idleMs = TALK_IDLE_MS, maxMs = TALK_MAX_MS }) {
++  const drainAnd = (status, body) => {
++    req.resume(); // read and discard whatever was sent, so the caller sees the answer instead of a reset
++    reply(status, body);
++  };
++  const ip = req.socket?.remoteAddress ?? "";
++  if (!allowed(ip)) {
++    log(`/talk ${sn} refused for ${ip}: not on BRIDGE_TALK_ALLOW`);
++    return drainAnd(403, { error: "talk is only accepted from the allowed networks (BRIDGE_TALK_ALLOW)" });
++  }
++  if (req.method !== "POST" && req.method !== "PUT") return drainAnd(405, { error: "POST the audio" });
++  const format = url.searchParams.get("format") ?? "s16le";
++  if (!INPUT[format]) return drainAnd(400, { error: `format must be one of ${Object.keys(INPUT).join(", ")}` });
++  const lease = watchedLease();
++  if (!lease) return drainAnd(409, { error: "talk only works during a live view; no /stream is open for this camera" });
++
++  let talk;
++  try {
++    const client = await lease;
++    const cam = (await client.getDevice(sn)).camera?.();
++    if (!cam?.talkback) return drainAnd(404, { error: "this camera has no talkback" });
++    talk = await cam.talkback();
++  } catch (e) {
++    return drainAnd(502, { error: String(e?.message ?? e) });
++  }
++  if (talk.codec !== "aac-lc") {
++    void talk.stop();
++    return drainAnd(415, { error: `this camera's speaker plays ${talk.codec}, which the bridge can't encode` });
++  }
++  log(`/talk ${sn} started (${format}) from ${ip}`);
++
++  const enc = spawnEncoder(format);
++  const errors = [];
++  let bytes = 0;
++  let finished = false;
++  let idleTimer;
++  const maxTimer = setTimeout(() => stop("the talk reached its time limit"), maxMs);
++  const touch = () => {
++    clearTimeout(idleTimer);
++    idleTimer = setTimeout(() => stop("no audio for a while"), idleMs);
++  };
++  touch();
++  talk.on("error", (e) => errors.push(String(e?.message ?? e)));
++  enc.stderr?.on("data", (d) => errors.push(String(d).trim()));
++  enc.stdout.pipe(talk.writable()); // ends the talk's input when ffmpeg exits, after its last frame
++
++  function stop(reason) {
++    if (finished) return;
++    finished = true;
++    clearTimeout(idleTimer);
++    clearTimeout(maxTimer);
++    enc.stdin.end();
++    // Let the last queued frames play, but don't wait on a device that never finishes.
++    let ended = false;
++    const hardStop = setTimeout(() => done(), 3_000);
++    const done = () => {
++      if (ended) return;
++      ended = true;
++      clearTimeout(hardStop);
++      void talk.stop();
++      log(`/talk ${sn} ended (${reason}; ${bytes} bytes${errors.length ? `; ${errors.slice(-1)[0]}` : ""})`);
++      if (!res.headersSent && !res.destroyed) reply(200, { ok: true, bytes, reason, errors: errors.slice(-3) });
++    };
++    talk.once("finished", done);
++    talk.once("stop", done);
++    enc.once("exit", () => setTimeout(() => !talk.pending && done(), 200));
++  }
++
++  req.on("data", (chunk) => {
++    if (finished) return;
++    bytes += chunk.length;
++    touch();
++    if (!enc.stdin.write(chunk)) {
++      req.pause();
++      enc.stdin.once("drain", () => req.resume());
++    }
++  });
++  req.on("end", () => stop("the caller finished"));
++  req.on("close", () => stop("the caller left"));
++  enc.on("error", (e) => {
++    errors.push(String(e?.message ?? e));
++    stop("the encoder failed");
++  });
++}

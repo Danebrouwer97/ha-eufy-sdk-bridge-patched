@@ -1,0 +1,4 @@
+# https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
+name: eufy-sdk bridge (patched)
+url: "https://github.com/Danebrouwer97/ha-eufy-sdk-bridge-patched"
+maintainer: Dane Brouwer
