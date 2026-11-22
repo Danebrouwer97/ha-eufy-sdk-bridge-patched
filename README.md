@@ -25,6 +25,7 @@ once a release includes it.
 |---|---|
 | `eufy_sdk_bridge_patched/` | The app. `Dockerfile` builds FROM the official app image and applies `runtime.patch`; `config.yaml` is generated from the official one. |
 | `patches/0001-live-audio-and-push-to-talk.patch` | The full change to the bridge, tests included. It's the source of `runtime.patch`, and what goes upstream. |
+| `patches/0002-door-event-recordings.patch` | Door event recordings (`/events`, `/event-thumb`, `/event-video`); the same file as the app's `recordings.patch`, applied after `runtime.patch`. |
 | `scripts/check-upstream.sh` | Checks the official app for a new version, applies the patch to its bridge, runs the bridge's tests and builds the app. |
 | `scripts/make-app-config.py` | Writes the app's `config.yaml` from the official one. |
 | `.github/workflows/check-upstream.yml` | Runs the check daily. It opens a pull request when an update passes, and an issue when it doesn't. |
