@@ -89,7 +89,7 @@ fi
 echo "::group::Build the app image on $IMAGE:$official"
 docker build --pull --build-arg "BUILD_FROM=$IMAGE:$official" -t eufy-sdk-bridge-patched:test "$APP"
 docker run --rm --entrypoint sh eufy-sdk-bridge-patched:test -c \
-  'test -f /app/src/live-audio.mjs && test -f /app/src/talkback-route.mjs && grep -q eufy_audio /app/go2rtc-config.mjs'
+  'test -f /app/src/live-audio.mjs && test -f /app/src/talkback-route.mjs && grep -q eufy_audio /app/go2rtc-config.mjs && test -f /app/src/recordings.mjs'
 echo "::endgroup::"
 
 out status "$([ "$MODE" = check ] && echo updated || echo verified)"

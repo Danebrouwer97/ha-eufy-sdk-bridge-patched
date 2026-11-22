@@ -1,0 +1,434 @@
+diff -ruN a/server.mjs b/server.mjs
+--- a/server.mjs	2026-11-22 01:48:10
++++ b/server.mjs	2026-11-22 01:48:49
+@@ -29,6 +29,7 @@
+ import { createBoot } from "./src/boot.mjs";
+ import { createSolix } from "./src/solix.mjs";
+ import { createClips } from "./src/clip.mjs";
++import { createRecordings } from "./src/recordings.mjs";
+ import { createHttpHandler } from "./src/http-routes.mjs";
+ import { createWsServer } from "./src/ws-server.mjs";
+ import { closeStreamClients } from "./streams.mjs";
+@@ -71,6 +72,7 @@
+   createBoot(ctx),
+   createSolix(ctx),
+   createClips(ctx),
++  createRecordings(ctx),
+ );
+ 
+ const httpServer = http.createServer(createHttpHandler(ctx));
+diff -ruN a/src/http-routes.mjs b/src/http-routes.mjs
+--- a/src/http-routes.mjs	2026-11-22 01:48:10
++++ b/src/http-routes.mjs	2026-11-22 01:58:11
+@@ -312,6 +312,45 @@
+     }
+ 
+     // The recording a HomeBase 2 stored for this camera's latest detection, as an mp4 (see clip.mjs).
++    // A camera's recorded events (newest first) and each event's picture, from its station (see recordings.mjs).
++    if (kind === "events" && sn) {
++      const r = (await ctx.listEvents?.(sn, {
++        days: Number(url.searchParams.get("days")) || 7,
++        count: Number(url.searchParams.get("count")) || 50,
++      })) ?? { status: 404, error: "events unavailable" };
++      return json(res, r.status, r.status === 200 ? { events: r.events } : { error: r.error });
++    }
++    if (kind === "event-thumb" && sn) {
++      const r = (await ctx.eventThumb?.(sn, url.pathname.split("/")[3])) ?? { status: 404, error: "events unavailable" };
++      if (!r.jpeg) return json(res, r.status ?? 404, { error: r.error ?? "no image" });
++      res.writeHead(200, { "content-type": "image/jpeg", "content-length": r.jpeg.length, "cache-control": "max-age=86400" });
++      return res.end(r.jpeg);
++    }
++    if (kind === "event-video" && sn) {
++      const r = (await ctx.eventVideo?.(sn, url.pathname.split("/")[3])) ?? { status: 404, error: "events unavailable" };
++      if (!r.file) return json(res, r.status ?? 404, { error: r.error ?? "no video" });
++      const size = (await fs.promises.stat(r.file)).size;
++      const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
++      let start = 0;
++      let end = size - 1;
++      if (m && (m[1] || m[2])) {
++        start = m[1] ? Number(m[1]) : Math.max(0, size - Number(m[2]));
++        end = m[1] && m[2] ? Math.min(Number(m[2]), size - 1) : size - 1;
++        if (start > end || start >= size) {
++          res.writeHead(416, { "content-range": `bytes */${size}` });
++          return res.end();
++        }
++      }
++      const partial = !!m && (start > 0 || end < size - 1);
++      res.writeHead(partial ? 206 : 200, {
++        "content-type": "video/mp4",
++        "content-length": end - start + 1,
++        "accept-ranges": "bytes",
++        "cache-control": "max-age=86400",
++        ...(partial ? { "content-range": `bytes ${start}-${end}/${size}` } : {}),
++      });
++      return fs.createReadStream(r.file, { start, end }).pipe(res);
++    }
+     if (kind === "clip" && sn) {
+       const clip = (await ctx.clipFor?.(sn)) ?? { status: 404, error: "clips unavailable" };
+       if (!clip.mp4) {
+diff -ruN a/src/recordings.mjs b/src/recordings.mjs
+--- a/src/recordings.mjs	1970-01-01 01:00:00
++++ b/src/recordings.mjs	2026-11-22 02:19:33
+@@ -0,0 +1,352 @@
++// /events/<sn>, /event-thumb/<sn>/<recordId> and /event-video/<sn>/<recordId>: a camera's recorded events, each
++// event's picture and its video. The list and pictures are read from
++// the station's own database over P2P, the way the eufy app lists them. `history_record_info` is queried with
++// inner cmd 10017 ("query local", date-ranged); each row carries the start and end time, the trigger and the
++// path of the event's thumbnail on the station's card, which is fetched with the same image request the
++// "Last event" cover uses. Verified on a Chime T8020 holding a T8210 doorbell's events.
++//
++// The VIDEO comes with the plain download request (CMD_DOWNLOAD_VIDEO 1024, the row's storage_path). The station
++// answers 1024 with an int32 0 and a 10-digit code, then streams the recording (1300/1301, data type 3) and ends
++// with 1304. P-frames and audio are in the clear; each keyframe's first 128 payload bytes are AES-128-ECB under
++// the first 16 bytes of getImageKey(station serial, station p2p_did, code), the same derivation as the stored
++// pictures (eufy-sdk issue #385; verified here on a Chime T8020 recording: clean 2048x1536 H.264 + AAC). No cipher
++// key is involved, so this works for a shared account. A path no longer on the card answers -111.
++//
++// Every station read goes through the warmup's DB lock (ctx.withDbLock), so it never overlaps the "Last event"
++// refreshes, which share the session's one dbChunk/image stream.
++import fs from "node:fs";
++import path from "node:path";
++import { normalizePushImage, getImageKey } from "@mega-yfue/eufy-sdk";
++import { createDecipheriv } from "node:crypto";
++import { muxMp4 } from "./clip.mjs";
++
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++const DAY_MS = 86_400_000;
++const LIST_TTL_MS = Number(process.env.EVENTS_LIST_TTL_MS) || 30_000;
++const THUMB_KEEP = Number(process.env.EVENTS_THUMB_KEEP) || 300; // cached thumbnails kept per camera
++const SN_RE = /^[A-Z0-9]{8,24}$/;
++const VIDEO_KEEP = Number(process.env.EVENTS_VIDEO_KEEP) || 30; // cached event videos kept per camera
++const ERROR_OPEN_FILE_FAIL = -111;
++
++/** yyyyMMdd in the bridge's local time (the station's rows are in its own local time too). */
++const ymd = (d) => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
++
++/** "ring", "person" or "motion" for a row and its crop-picture companion (best effort; raw fields are kept). */
++export function eventKind(rec, crop) {
++  if (rec?.trigger_type === 8 || rec?.video_type === 1000) return "ring";
++  if (crop && (crop.detection_type === 2 || (Number.isInteger(crop.person_id) && crop.person_id >= 0))) return "person";
++  return "motion";
++}
++
++/** Seconds between two "yyyy-MM-dd HH:mm:ss" stamps, or undefined. */
++function secondsBetween(a, b) {
++  const t = (s) => Date.parse(String(s).replace(" ", "T"));
++  const d = (t(b) - t(a)) / 1000;
++  return Number.isFinite(d) && d >= 0 ? d : undefined;
++}
++
++/**
++ * The same query read in the clear, for a standalone camera (Indoor Cam C220) that answers `CMD_DATABASE` (1306)
++ * with signCode 0: the SDK only reassembles encrypted replies into `dbChunk`, so `readDatabase` times out there.
++ * The reply's `data` is then a JSON array, or a string holding one. Answers the groups, or throws.
++ */
++export async function queryRecordsInTheClear(session, { accountId, startDate, endDate, count, channel = 0 }) {
++  let reply;
++  const onData = (f) => {
++    if (f.commandId === 1306 && f.json && f.json.table === "history_record_info") reply = f.json;
++  };
++  session.on("data", onData);
++  try {
++    // This camera drops some requests outright, so ask up to three times, 3 s apart.
++    for (let attempt = 0; attempt < 3 && !reply; attempt++) {
++      session.queryDatabase("history_record_info", {
++        accountId,
++        channel,
++        innerCmd: 10017,
++        query: { count, start_date: startDate, end_date: endDate, start_time: "0", event_type: 0, ai_type: 0,
++          storage_cloud: -1, trigger_type: 0, detection_type: 0, flag: 0 },
++      });
++      for (let i = 0; i < 15 && !reply; i++) await sleep(200);
++    }
++  } finally {
++    session.off?.("data", onData);
++  }
++  if (!reply) throw new Error("no plaintext history_record_info either");
++  if (reply.mIntRet !== 0 && reply.mIntRet !== undefined) throw new Error(`station answered ${reply.mIntRet}`);
++  const data = typeof reply.data === "string" ? JSON.parse(reply.data || "[]") : reply.data;
++  if (!Array.isArray(data)) return [];
++  // Grouped like the encrypted reply ({table_name, payload:[…]}), or bare rows.
++  return data.length && data[0]?.table_name ? data : [{ table_name: "history_record_info", payload: data }];
++}
++
++/** Split a query reply into recording rows and a record_id → crop map. */
++export function rowsOf(groups) {
++  const recs = [];
++  const crops = new Map();
++  for (const g of Array.isArray(groups) ? groups : []) {
++    const items = Array.isArray(g?.payload) ? g.payload : [];
++    if (g?.table_name === "record_crop_picture_info") {
++      for (const c of items) if (c?.record_id !== undefined && !crops.has(c.record_id)) crops.set(c.record_id, c);
++    } else {
++      for (const r of items) if (r?.record_id !== undefined && r.start_time) recs.push(r);
++    }
++  }
++  recs.sort((x, y) => String(y.start_time).localeCompare(String(x.start_time)));
++  return { recs, crops };
++}
++
++export function createRecordings(ctx) {
++  const { eufy, eventImageDir } = ctx;
++  const thumbRoot = path.join(eventImageDir, "event-thumbs");
++  const lists = new Map(); // `${sn}:${days}:${count}` -> { at, events }
++  const thumbPaths = new Map(); // sn -> Map(recordId -> path on the station's card)
++  const videoPaths = new Map(); // sn -> Map(recordId -> recording path on the station's card)
++  const downloads = new Map(); // stationSn -> promise chain: one download at a time per station
++  const building = new Map(); // `${sn}/${id}` -> promise of the video being built
++  const inTheClear = new Set(); // stations seen answering the records query only in plaintext
++  const silentUntil = new Map(); // stationSn -> time before which a station that didn't answer isn't asked again
++  const SILENT_BACKOFF_MS = 10 * 60_000;
++  const lock = (fn) => (ctx.withDbLock ? ctx.withDbLock(fn) : fn());
++
++  /** The station session a camera's events live on, with the account id and p2p_did its reads need. */
++  async function stationFor(sn) {
++    const devs = await eufy.getDevices();
++    const dev = devs.find((d) => d.sn === sn);
++    if (!dev) return { status: 404, error: "no such device" };
++    const stationSn = dev.stationSn ?? dev.raw?.station_sn ?? sn;
++    const station = devs.find((d) => d.sn === stationSn) ?? dev;
++    const session = eufy.getP2pSessions?.().get(stationSn);
++    if (!session?.isConnected) return { status: 503, error: "the camera's station is not connected" };
++    if (typeof session.queryRecordPage !== "function") return { status: 501, error: "the SDK cannot list recordings" };
++    const accountId =
++      station.raw?.member?.admin_user_id ?? dev.raw?.member?.admin_user_id ?? eufy.api?.auth?.userId ?? "";
++    const channel = Number.isInteger(dev.raw?.device_channel) ? dev.raw.device_channel : 0;
++    return { session, stationSn, accountId, p2pDid: station.p2pDid ?? station.raw?.p2p_did, channel };
++  }
++
++  /** The camera's events of the last `days` days, newest first: `{ status, events }` or `{ status, error }`. */
++  async function listEvents(sn, { days = 7, count = 50 } = {}) {
++    if (!SN_RE.test(String(sn))) return { status: 400, error: "bad serial" };
++    days = Math.max(1, Math.min(31, Math.trunc(days) || 7));
++    count = Math.max(1, Math.min(100, Math.trunc(count) || 50));
++    const key = `${sn}:${days}:${count}`;
++    const cached = lists.get(key);
++    if (cached && Date.now() - cached.at < LIST_TTL_MS) return { status: 200, events: cached.events };
++    const st = await stationFor(sn);
++    if (!st.session) return st;
++    if ((silentUntil.get(st.stationSn) ?? 0) > Date.now()) {
++      return { status: 502, error: "the station did not answer the recordings query (asking again later)" };
++    }
++    let groups;
++    const range = {
++      accountId: st.accountId,
++      startDate: ymd(new Date(Date.now() - days * DAY_MS)),
++      endDate: ymd(new Date(Date.now() + DAY_MS)),
++      count,
++    };
++    try {
++      if (inTheClear.has(st.stationSn)) throw new Error("answers in plaintext");
++      groups = await lock(() => st.session.queryRecordPage(range));
++    } catch (e) {
++      try {
++        groups = await lock(() => queryRecordsInTheClear(st.session, { ...range, channel: st.channel }));
++        inTheClear.add(st.stationSn);
++      } catch (e2) {
++        ctx.eventLog?.(`/events ${sn} → 502 ${e?.message ?? e}; ${e2?.message ?? e2}`);
++        silentUntil.set(st.stationSn, Date.now() + SILENT_BACKOFF_MS);
++        return { status: 502, error: "the station did not answer the recordings query" };
++      }
++    }
++    const { recs, crops } = rowsOf(groups);
++    const paths = thumbPaths.get(sn) ?? new Map();
++    const vpaths = videoPaths.get(sn) ?? new Map();
++    const events = [];
++    for (const r of recs) {
++      if (r.device_sn && r.device_sn !== sn) continue; // a station lists every camera it holds
++      const crop = crops.get(r.record_id);
++      if (r.thumb_path) paths.set(String(r.record_id), r.thumb_path);
++      if (r.storage_path) vpaths.set(String(r.record_id), r.storage_path);
++      events.push({
++        id: r.record_id,
++        start: r.start_time,
++        end: r.end_time,
++        seconds: secondsBetween(r.start_time, r.end_time),
++        kind: eventKind(r, crop),
++        trigger: r.trigger_type,
++        thumb: r.thumb_path ? `/event-thumb/${sn}/${r.record_id}` : undefined,
++        video: r.storage_path ? `/event-video/${sn}/${r.record_id}` : undefined,
++      });
++    }
++    thumbPaths.set(sn, paths);
++    videoPaths.set(sn, vpaths);
++    lists.set(key, { at: Date.now(), events });
++    return { status: 200, events };
++  }
++
++  /** Request one image path from the station: JPEG bytes within ~8 s, or undefined. */
++  async function fetchImage(session, filePath, accountId, p2pDid) {
++    let jpeg;
++    const onImage = ({ file, data }) => {
++      if (file !== filePath || !data) return;
++      const img = normalizePushImage(data, p2pDid);
++      if (img?.[0] === 0xff && img?.[1] === 0xd8) jpeg = Buffer.from(img);
++    };
++    session.on("image", onImage);
++    try {
++      session.requestImage(filePath, { accountId });
++      for (let i = 0; i < 40 && !jpeg; i++) await sleep(200);
++    } finally {
++      session.off?.("image", onImage);
++    }
++    return jpeg;
++  }
++
++  /** Keep the newest `keep` cached files with extension `ext` in a camera's folder. */
++  async function prune(dir, keep = THUMB_KEEP, ext = ".jpg") {
++    try {
++      const files = (await fs.promises.readdir(dir)).filter((f) => f.endsWith(ext));
++      if (files.length <= keep) return;
++      const byAge = await Promise.all(
++        files.map(async (f) => ({ f, t: (await fs.promises.stat(path.join(dir, f))).mtimeMs })),
++      );
++      byAge.sort((a, b) => b.t - a.t);
++      for (const { f } of byAge.slice(keep)) await fs.promises.rm(path.join(dir, f), { force: true });
++    } catch {
++      /* best effort */
++    }
++  }
++
++  /** One event's picture: `{ jpeg }` (from the disk cache when it has it) or `{ status, error }`. */
++  async function eventThumb(sn, id) {
++    if (!SN_RE.test(String(sn)) || !/^\d{1,12}$/.test(String(id))) return { status: 400, error: "bad request" };
++    const dir = path.join(thumbRoot, sn);
++    const file = path.join(dir, `${id}.jpg`);
++    try {
++      return { jpeg: await fs.promises.readFile(file) };
++    } catch {
++      /* not cached yet */
++    }
++    let thumbPath = thumbPaths.get(sn)?.get(String(id));
++    if (!thumbPath) {
++      const listed = await listEvents(sn, { days: 31, count: 100 });
++      if (listed.status !== 200) return listed;
++      thumbPath = thumbPaths.get(sn)?.get(String(id));
++    }
++    if (!thumbPath) return { status: 404, error: "no such event" };
++    const st = await stationFor(sn);
++    if (!st.session) return st;
++    const jpeg = await lock(() => fetchImage(st.session, thumbPath, st.accountId, st.p2pDid));
++    if (!jpeg) {
++      ctx.eventLog?.(`/event-thumb ${sn} ${id} → 504 no image`);
++      return { status: 504, error: "the station sent no image" };
++    }
++    await fs.promises.mkdir(dir, { recursive: true });
++    await fs.promises.writeFile(file, jpeg);
++    void prune(dir);
++    return { jpeg };
++  }
++
++  /**
++   * Download one recording from the station and decode it: `{ video, audio, fps }` elementary streams, or a
++   * `{ status, error }`. The download request is retried (with a cancel between) when the station doesn't answer,
++   * which happens now and then; frames are taken on the device's channel or 100 + it (standalone cameras).
++   */
++  async function downloadRecording(st, filePath) {
++    const { session, accountId, channel } = st;
++    const media = new Set([channel, 100 + channel]);
++    let reply, finished = false, last = 0;
++    const frames = [];
++    const onData = (f) => {
++      if (f.commandId === 1024 && f.channel === 0 && f.raw) reply = Buffer.from(f.raw);
++      else if (f.commandId === 1304) finished = true;
++      else if ((f.commandId === 1300 || f.commandId === 1301) && f.dataType === 3 && media.has(f.channel)) {
++        frames.push({ video: f.commandId === 1300, signCode: f.signCode, raw: Buffer.from(f.raw) });
++        last = Date.now();
++      }
++    };
++    session.on("data", onData);
++    try {
++      for (let attempt = 0; attempt < 3 && !reply; attempt++) {
++        session.sendStringPairCommand(1024, filePath, accountId, channel);
++        for (let i = 0; i < 100 && !reply; i++) await sleep(50);
++        if (!reply) {
++          session.sendStringPairCommand(1051, "", accountId, channel); // CMD_DOWNLOAD_CANCEL, then ask again
++          await sleep(1500);
++        }
++      }
++      if (!reply || reply.length < 14) return { status: 504, error: "the station did not answer the download" };
++      const result = reply.readInt32LE(0);
++      if (result === ERROR_OPEN_FILE_FAIL) return { status: 404, error: "this recording is no longer on the card" };
++      if (result !== 0) return { status: 502, error: `the station refused the download (${result})` };
++      const code = reply.subarray(4, 36).toString("latin1").split("\0")[0];
++      const started = Date.now();
++      while (!finished && Date.now() - started < 120_000) {
++        await sleep(250);
++        if (frames.length && Date.now() - last > 10_000) break; // quiet: the station is done
++        if (!frames.length && Date.now() - started > 20_000) break;
++      }
++      if (!frames.some((f) => f.video)) return { status: 504, error: "the station sent no video" };
++      const key = Buffer.from(getImageKey(st.stationSn, st.p2pDid, code), "utf-8").subarray(0, 16);
++      const video = [];
++      const audio = [];
++      let fps = 0;
++      for (const f of frames) {
++        if (!f.video) {
++          audio.push(f.raw.subarray(16)); // a 16-byte header, then ADTS AAC
++          continue;
++        }
++        const len = f.raw.readUInt32LE(0);
++        const body = Buffer.from(f.raw.subarray(22, 22 + len));
++        fps ||= f.raw.readUInt16LE(8);
++        if ((f.raw[4] & 1) === 1 && f.signCode > 0 && body.length >= 128) {
++          const d = createDecipheriv("aes-128-ecb", key, null);
++          d.setAutoPadding(false);
++          Buffer.concat([d.update(body.subarray(0, 128)), d.final()]).copy(body, 0);
++        }
++        video.push(body);
++      }
++      const h264 = Buffer.concat(video);
++      if (h264.readUInt32BE(0) !== 1) return { status: 502, error: "the recording could not be decrypted" };
++      return { video: h264, audio: Buffer.concat(audio), fps: fps > 0 && fps <= 60 ? fps : 15 };
++    } finally {
++      session.off?.("data", onData);
++    }
++  }
++
++  /** One event's video as an mp4 file path (built once, then cached), or `{ status, error }`. */
++  async function eventVideo(sn, id) {
++    if (!SN_RE.test(String(sn)) || !/^\d{1,12}$/.test(String(id))) return { status: 400, error: "bad request" };
++    const dir = path.join(eventImageDir, "event-videos", sn);
++    const file = path.join(dir, `${id}.mp4`);
++    if (fs.existsSync(file)) return { file };
++    const k = `${sn}/${id}`;
++    if (!building.has(k)) {
++      building.set(k, (async () => {
++        let filePath = videoPaths.get(sn)?.get(String(id));
++        if (!filePath) {
++          const listed = await listEvents(sn, { days: 31, count: 100 });
++          if (listed.status !== 200) return listed;
++          filePath = videoPaths.get(sn)?.get(String(id));
++        }
++        if (!filePath) return { status: 404, error: "no such event" };
++        const st = await stationFor(sn);
++        if (!st.session) return st;
++        const previous = downloads.get(st.stationSn) ?? Promise.resolve();
++        const run = previous.then(() => downloadRecording(st, filePath), () => downloadRecording(st, filePath));
++        downloads.set(st.stationSn, run.then(() => undefined, () => undefined));
++        const rec = await run;
++        if (!rec.video) {
++          ctx.eventLog?.(`/event-video ${sn} ${id} → ${rec.status} ${rec.error}`);
++          return rec;
++        }
++        await fs.promises.mkdir(dir, { recursive: true });
++        await muxMp4(rec, file);
++        void prune(dir, VIDEO_KEEP, ".mp4");
++        return { file };
++      })().finally(() => building.delete(k)));
++    }
++    return building.get(k);
++  }
++
++  return { listEvents, eventThumb, eventVideo };
++}
+diff -ruN a/src/warmup.mjs b/src/warmup.mjs
+--- a/src/warmup.mjs	2026-11-22 01:48:10
++++ b/src/warmup.mjs	2026-11-22 01:48:49
+@@ -696,5 +696,6 @@
+     forceRefreshEventImage,
+     autoHealEventImage: localEventRefresh ? autoHealEventImage : noop,
+     latestTriggerType,
++    withDbLock, // shared with recordings.mjs: its station reads must not overlap these
+   };
+ }

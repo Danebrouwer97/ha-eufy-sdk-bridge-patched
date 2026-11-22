@@ -2,7 +2,7 @@
 # Only name, version, slug, description, url and the removed `image:` differ. Don't edit by hand.
 # https://developers.home-assistant.io/docs/add-ons/configuration#add-on-configuration
 name: eufy-sdk bridge (patched)
-version: "0.8.2-audio.1"
+version: "0.8.2-audio.2"
 slug: eufy_sdk_bridge_patched
 description: The official eufy-sdk bridge 0.8.2 plus live camera sound and push-to-talk. See the README.
 url: "https://github.com/Danebrouwer97/ha-eufy-sdk-bridge-patched"
